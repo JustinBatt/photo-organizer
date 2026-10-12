@@ -16,10 +16,16 @@ try:
 except ImportError:
     HEIF_SUPPORTED = False
 
-_TAG_NAME_TO_ID = {v: k for k, v in ExifTags.TAGS.items()}
-_DATE_TAKEN_TAG = _TAG_NAME_TO_ID.get("DateTimeOriginal")
-_MAKE_TAG = _TAG_NAME_TO_ID.get("Make")
-_MODEL_TAG = _TAG_NAME_TO_ID.get("Model")
+# EXIF tag numbers. Make/Model/DateTime live in the main block (IFD0), but
+# the real "date taken" tags live in the Exif sub-block that IFD0 points to.
+_MAKE_TAG = 0x010F            # 271
+_MODEL_TAG = 0x0110           # 272
+_DATETIME_TAG = 0x0132        # 306  (IFD0: last modified, a weak fallback)
+_EXIF_IFD_POINTER = 0x8769    # 34665
+_DATE_TIME_ORIGINAL = 0x9003  # 36867
+_DATE_TIME_DIGITIZED = 0x9004 # 36868
+_SUBSEC_TIME_ORIGINAL = 0x9291   # 37521
+_SUBSEC_TIME_DIGITIZED = 0x9292  # 37522
 
 
 @dataclass
@@ -39,12 +45,9 @@ def extract(path: str) -> PhotoMetadata:
             meta.width, meta.height = img.size
             exif = img.getexif()
             if exif:
-                raw_date = exif.get(_DATE_TAKEN_TAG) if _DATE_TAKEN_TAG else None
-                make = exif.get(_MAKE_TAG) if _MAKE_TAG else None
-                model = exif.get(_MODEL_TAG) if _MODEL_TAG else None
-
-                if raw_date:
-                    meta.date_taken = _normalize_exif_date(raw_date)
+                make = exif.get(_MAKE_TAG)
+                model = exif.get(_MODEL_TAG)
+                meta.date_taken = _read_date_taken(exif)
                 if make:
                     meta.camera_make = str(make).strip().strip("\x00")
                 if model:
@@ -59,10 +62,42 @@ def extract(path: str) -> PhotoMetadata:
     return meta
 
 
-def _normalize_exif_date(raw_date: str) -> Optional[str]:
-    # EXIF dates look like "2023:06:14 10:22:31"
+def _read_date_taken(exif) -> Optional[str]:
+    """
+    The moment the photo was taken, as "YYYY-MM-DDTHH:MM:SS" (plus ".NN" when
+    the camera recorded sub-seconds, which keeps burst shots apart).
+    Prefers DateTimeOriginal, then DateTimeDigitized, then the weaker IFD0
+    DateTime.
+    """
     try:
-        dt = datetime.strptime(str(raw_date), "%Y:%m:%d %H:%M:%S")
-        return dt.isoformat()
+        sub = exif.get_ifd(_EXIF_IFD_POINTER)
+    except Exception:
+        sub = {}
+    candidates = (
+        (sub.get(_DATE_TIME_ORIGINAL), sub.get(_SUBSEC_TIME_ORIGINAL)),
+        (sub.get(_DATE_TIME_DIGITIZED), sub.get(_SUBSEC_TIME_DIGITIZED)),
+        (exif.get(_DATE_TIME_ORIGINAL), None),  # some writers put it in IFD0
+        (exif.get(_DATETIME_TAG), None),
+    )
+    for raw, subsec in candidates:
+        if not raw:
+            continue
+        iso = _normalize_exif_date(raw)
+        if iso:
+            digits = "".join(ch for ch in str(subsec or "") if ch.isdigit())
+            return f"{iso}.{digits}" if digits else iso
+    return None
+
+
+def _normalize_exif_date(raw_date) -> Optional[str]:
+    # EXIF dates look like "2023:06:14 10:22:31"
+    if isinstance(raw_date, bytes):
+        raw_date = raw_date.decode("ascii", "ignore")
+    text = str(raw_date).strip().strip("\x00")
+    try:
+        dt = datetime.strptime(text, "%Y:%m:%d %H:%M:%S")
     except (ValueError, TypeError):
         return None
+    if dt.year < 1900:
+        return None
+    return dt.isoformat()

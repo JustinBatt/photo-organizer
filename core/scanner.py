@@ -34,6 +34,10 @@ def scan_roots(
     scan_id = db.create_scan(roots, started_at)
 
     ignored_files, ignored_folders = db.ignore_sets()
+    # Never index the quarantine location - those folders are being held aside.
+    quarantine_root = db.get_setting("quarantine_root")
+    if quarantine_root:
+        ignored_folders = list(ignored_folders) + [normalize_path(quarantine_root)]
 
     def under_ignored_folder(norm_path: str) -> bool:
         return any(

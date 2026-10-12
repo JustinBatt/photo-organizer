@@ -1,23 +1,21 @@
 import os
 import time
 
-from PySide6.QtCore import (
-    Qt, QSize, QDate, QTimer, Signal, QAbstractListModel, QModelIndex,
-)
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import Qt, QDate, QTimer, Signal, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLineEdit, QLabel,
-    QPushButton, QDateEdit, QListView, QAbstractItemView, QStyledItemDelegate,
-    QStyle, QDialog, QListWidget, QListWidgetItem,
+    QPushButton, QDateEdit, QAbstractItemView, QDialog, QListWidget,
+    QListWidgetItem, QSplitter, QMessageBox,
 )
 
 from .thumbnails import ThumbnailLoader
-
-PATH_ROLE = Qt.ItemDataRole.UserRole
-FOLDER_ROLE = Qt.ItemDataRole.UserRole + 1
-
-THUMB = 150
-CELL_W, CELL_H = 180, 222
+from .photo_grid import (  # noqa: F401  (re-exported for other modules/tests)
+    PhotoListModel, PhotoDelegate, make_photo_view, selected_paths,
+    PATH_ROLE, FOLDER_ROLE, THUMB, CELL_W, CELL_H,
+)
+from .preview_panel import PhotoPreview
+from .album_dialogs import CreateAlbumDialog, AddToAlbumDialog
 
 # Ignore clicks closer together than this are dropped, so the second click of
 # a double-click can't ignore whatever photo slid into place after the first.
@@ -27,101 +25,6 @@ IGNORE_DEBOUNCE_SECONDS = 0.35
 def _under_folder(folder: str, target_lower: str, prefix_lower: str) -> bool:
     f = folder.lower()
     return f == target_lower or f.startswith(prefix_lower)
-
-
-class PhotoListModel(QAbstractListModel):
-    """Holds only (path, filename, folder) per photo; thumbnails come from the
-    loader on demand, so 65,000+ rows cost almost nothing until scrolled to."""
-
-    def __init__(self, loader: ThumbnailLoader, parent=None):
-        super().__init__(parent)
-        self._loader = loader
-        self._rows: list[tuple[str, str, str]] = []
-        self._index: dict[str, int] = {}
-        loader.loaded.connect(self._on_thumbnail_loaded)
-
-    def rows(self) -> list[tuple[str, str, str]]:
-        return self._rows
-
-    def set_rows(self, db_rows):
-        self.beginResetModel()
-        self._rows = [(r["path"], r["filename"], r["folder"]) for r in db_rows]
-        self._index = {p: i for i, (p, _, _) in enumerate(self._rows)}
-        self.endResetModel()
-
-    def remove_where(self, predicate) -> int:
-        before = len(self._rows)
-        self.beginResetModel()
-        self._rows = [r for r in self._rows if not predicate(r)]
-        self._index = {p: i for i, (p, _, _) in enumerate(self._rows)}
-        self.endResetModel()
-        return before - len(self._rows)
-
-    def row_data(self, row: int) -> tuple[str, str, str]:
-        return self._rows[row]
-
-    # --- Qt model interface ------------------------------------------
-
-    def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self._rows)
-
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid() or not (0 <= index.row() < len(self._rows)):
-            return None
-        path, filename, folder = self._rows[index.row()]
-        if role == Qt.ItemDataRole.DisplayRole:
-            return filename
-        if role == Qt.ItemDataRole.DecorationRole:
-            return self._loader.pixmap_or_request(path)
-        if role == Qt.ItemDataRole.ToolTipRole:
-            return path
-        if role == PATH_ROLE:
-            return path
-        if role == FOLDER_ROLE:
-            return folder
-        return None
-
-    def _on_thumbnail_loaded(self, path: str):
-        row = self._index.get(path)
-        if row is not None:
-            idx = self.index(row)
-            self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
-
-
-class PhotoDelegate(QStyledItemDelegate):
-    """Draws a centred thumbnail, the file name, and the (tail of the) folder path."""
-
-    def sizeHint(self, option, index):
-        return QSize(CELL_W, CELL_H)
-
-    def paint(self, painter, option, index):
-        painter.save()
-        selected = bool(option.state & QStyle.StateFlag.State_Selected)
-        if selected:
-            painter.fillRect(option.rect, option.palette.highlight())
-
-        rect = option.rect.adjusted(4, 4, -4, -4)
-        pm = index.data(Qt.ItemDataRole.DecorationRole)
-        if isinstance(pm, QPixmap) and not pm.isNull():
-            x = rect.x() + (rect.width() - pm.width()) // 2
-            y = rect.y() + (THUMB - pm.height()) // 2
-            painter.drawPixmap(x, y, pm)
-
-        text_color = option.palette.highlightedText().color() if selected else option.palette.text().color()
-        fm = painter.fontMetrics()
-        line_h = fm.height()
-        top = rect.y() + THUMB + 6
-
-        painter.setPen(text_color)
-        name = fm.elidedText(index.data(Qt.ItemDataRole.DisplayRole) or "", Qt.TextElideMode.ElideMiddle, rect.width())
-        painter.drawText(rect.x(), top, rect.width(), line_h, Qt.AlignmentFlag.AlignCenter, name)
-
-        folder_color = text_color
-        folder_color.setAlpha(170)
-        painter.setPen(folder_color)
-        folder = fm.elidedText(index.data(FOLDER_ROLE) or "", Qt.TextElideMode.ElideLeft, rect.width())
-        painter.drawText(rect.x(), top + line_h + 2, rect.width(), line_h, Qt.AlignmentFlag.AlignCenter, folder)
-        painter.restore()
 
 
 class IgnoredDialog(QDialog):
@@ -181,6 +84,8 @@ class IgnoredDialog(QDialog):
 class BrowseTab(QWidget):
     # Emitted whenever ignore rules change, so other tabs can refresh.
     ignores_changed = Signal()
+    # Emitted after photos were put into an album (Albums tab must refresh).
+    albums_changed = Signal()
 
     def __init__(self, db):
         super().__init__()
@@ -265,23 +170,40 @@ class BrowseTab(QWidget):
         self.count_label = QLabel("")
         layout.addWidget(self.count_label)
 
-        # --- photo grid ------------------------------------------------
-        self.view = QListView()
-        self.view.setModel(self.model)
-        self.view.setItemDelegate(PhotoDelegate(self.view))
-        self.view.setViewMode(QListView.ViewMode.IconMode)
-        self.view.setResizeMode(QListView.ResizeMode.Adjust)
-        self.view.setMovement(QListView.Movement.Static)
-        self.view.setUniformItemSizes(True)
-        self.view.setGridSize(QSize(CELL_W, CELL_H))
-        self.view.setSpacing(0)
-        self.view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.view.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.view.setMouseTracking(True)
+        # --- album actions ---------------------------------------------
+        album_row = QHBoxLayout()
+        self.select_all_btn = QPushButton("Select all shown")
+        self.select_all_btn.clicked.connect(lambda: self.view.selectAll())
+        self.clear_sel_btn = QPushButton("Clear selection")
+        self.clear_sel_btn.clicked.connect(lambda: self.view.clearSelection())
+        self.create_album_btn = QPushButton("Create album from selected…")
+        self.create_album_btn.clicked.connect(self.create_album_from_selected)
+        self.add_album_btn = QPushButton("Add selected to album…")
+        self.add_album_btn.clicked.connect(self.add_selected_to_album)
+        self.selected_label = QLabel("")
+        for w in (self.select_all_btn, self.clear_sel_btn, self.create_album_btn, self.add_album_btn):
+            album_row.addWidget(w)
+        album_row.addStretch()
+        album_row.addWidget(self.selected_label)
+        layout.addLayout(album_row)
+
+        # --- photo grid + preview panel ----------------------------------
+        self.view = make_photo_view(self.model)
         self.view.clicked.connect(self._on_clicked)
+        self.view.doubleClicked.connect(self._on_double_clicked)
         self.view.entered.connect(self._show_path)
-        layout.addWidget(self.view, stretch=1)
+
+        self.preview = PhotoPreview(self.db, small_loader=self.loader)
+        self.view.selectionModel().currentChanged.connect(self._on_current_changed)
+        self.view.selectionModel().selectionChanged.connect(self._update_selection_ui)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self.view)
+        splitter.addWidget(self.preview)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([700, 400])
+        layout.addWidget(splitter, stretch=1)
 
         # Full path of the photo under the mouse / selected, always visible.
         self.path_label = QLabel(" ")
@@ -299,6 +221,7 @@ class BrowseTab(QWidget):
 
     def shutdown(self):
         self.loader.shutdown()
+        self.preview.shutdown()
 
     def refresh_folder_list(self):
         self.folder_combo.blockSignals(True)
@@ -322,6 +245,8 @@ class BrowseTab(QWidget):
         self.model.set_rows(rows)
         self.count_label.setText(f"{len(rows):,} photo(s) match — scroll to see them all")
         self.path_label.setText(" ")
+        self.preview.clear()
+        self._update_selection_ui()
 
     def _show_path(self, index):
         if index.isValid():
@@ -368,6 +293,103 @@ class BrowseTab(QWidget):
             )
             self.view.viewport().unsetCursor()
 
+    # --- preview / selection ------------------------------------------------
+
+    def _on_current_changed(self, current, _previous):
+        # While an ignore button is armed a click means "ignore", not "look at".
+        if not current.isValid() or self._current_mode() is not None:
+            return
+        path = current.data(PATH_ROLE)
+        if path:
+            self.preview.show_photo(path)
+
+    def _on_double_clicked(self, index):
+        if index.isValid() and self._current_mode() is None:
+            path = index.data(PATH_ROLE)
+            if path:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def _update_selection_ui(self, *_):
+        n = len(self.view.selectionModel().selectedIndexes())
+        self.selected_label.setText(f"{n:,} selected" if n else "")
+        for btn in (self.create_album_btn, self.add_album_btn):
+            btn.setEnabled(n > 0)
+        self.clear_sel_btn.setEnabled(n > 0)
+
+    # --- albums ---------------------------------------------------------------
+
+    def _selected_photo_rows(self):
+        paths = selected_paths(self.view)
+        if not paths:
+            QMessageBox.information(
+                self, "Nothing selected",
+                "Select one or more photos first (Ctrl-click or Shift-click to pick several, "
+                "or use “Select all shown”)."
+            )
+            return [], []
+        return paths, self.db.photos_by_paths(paths)
+
+    def create_album_from_selected(self):
+        paths, rows = self._selected_photo_rows()
+        if not paths:
+            return
+        dlg = CreateAlbumDialog(self.db, rows, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._put_in_album(dlg.album_name, paths, dlg.existing_album_id)
+
+    def add_selected_to_album(self):
+        paths, _rows = self._selected_photo_rows()
+        if not paths:
+            return
+        dlg = AddToAlbumDialog(self.db, len(paths), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg.wants_new:
+            self.create_album_from_selected()
+            return
+        self._put_in_album(dlg.album_name, paths, dlg.album_id)
+
+    def _put_in_album(self, name: str, paths: list[str], album_id):
+        created = album_id is None
+        if created:
+            try:
+                album_id = self.db.create_album(name)
+            except ValueError as e:  # created elsewhere in the meantime
+                QMessageBox.warning(self, "Album exists", str(e))
+                return
+        self.db.add_photos_to_album(album_id, paths)
+
+        moved = set(paths)
+        self._remove_rows(lambda r: r[0] in moved)
+        self._resync_folder_combo()
+        self.count_label.setText(f"{len(self.model.rows()):,} photo(s) match — scroll to see them all")
+        self.path_label.setText(" ")
+        if self.preview.current_path in moved:
+            self.preview.clear()
+        self._update_selection_ui()
+        self.mode_label.setText(
+            f"<b>{'Created album' if created else 'Added to album'} “{name}”</b> with "
+            f"{len(moved):,} photo(s). They no longer show here - find them in the "
+            f"<b>Albums</b> tab."
+        )
+        self.albums_changed.emit()
+
+    def _resync_folder_combo(self):
+        """Drop folders that no longer have photos left to show (all albumed/ignored)."""
+        current = self.folder_combo.currentData()
+        folders = self.db.distinct_folders()
+        self.folder_combo.blockSignals(True)
+        self.folder_combo.clear()
+        self.folder_combo.addItem("All folders", None)
+        for folder in folders:
+            self.folder_combo.addItem(folder, folder)
+        idx = self.folder_combo.findData(current) if current is not None else 0
+        self.folder_combo.setCurrentIndex(max(idx, 0))
+        self.folder_combo.blockSignals(False)
+        if current is not None and idx < 0:
+            self.run_filter()  # the folder we were viewing is now empty
+
     def _on_clicked(self, index):
         self._show_path(index)
         mode = self._current_mode()
@@ -406,6 +428,9 @@ class BrowseTab(QWidget):
             )
         self.count_label.setText(f"{len(self.model.rows()):,} photo(s) match — scroll to see them all")
         self.path_label.setText(" ")
+        if self.preview.current_path and not self.model.has_path(self.preview.current_path):
+            self.preview.clear()
+        self._update_selection_ui()
         self.ignores_changed.emit()
 
     def _remove_rows(self, predicate) -> int:

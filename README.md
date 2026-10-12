@@ -53,57 +53,81 @@ A few things worth knowing about the built `.exe`:
 
 ## How it works
 
-The app has four tabs, meant to be used roughly in order:
+The app has five tabs, meant to be used roughly in order:
 
 1. **Scan** — pick one or more folders/drives. The scan automatically skips
    `Program Files`, `Windows`, `AppData`, `ProgramData`, and similar
    system/app locations without even walking into them (fast). Results are
-   saved to a local SQLite file (`photo_organizer.db`, created next to
-   `main.py`) so you don't have to rescan every time you reopen the app.
+   saved to a local SQLite file (`photo_organizer.db`, created next to the
+   app) so you don't have to rescan every time you reopen it.
+   **After upgrading from an older version, scan again once**: the
+   date-taken of camera photos is now read correctly, which duplicate
+   matching and album-date suggestions depend on.
 
 2. **Browse** — filter your indexed photos by folder, date range, or a
-   text search on filename/path. Every thumbnail shows its source folder
-   path underneath it, and the full path of whatever you point at appears
-   at the bottom. The whole collection is one scrollable list (tens of
-   thousands of photos are fine); thumbnails are loaded in the background
+   text search on filename/path. The whole collection is one scrollable list
+   (tens of thousands of photos are fine); thumbnails load in the background
    only for what's on screen.
+   - **Click a photo** to enlarge it in the side panel, with its full file
+     path, size, created date, modified date, dimensions, date taken and
+     camera. Double-click opens it in your normal photo viewer.
+   - **Albums:** select photos (click, Ctrl-click, Shift-click, or *Select all
+     shown*) and click **Create album from selected…**. The album name is
+     `date prefix + name`: the prefix is suggested from when the photos were
+     taken (`YY_MM`, e.g. `23_06`, or year-only), and the name from the
+     folder the photos are in. Both can be edited, and a name without a date
+     prefix is refused. **Add selected to album…** shows your list of
+     existing albums to pick from. Albums are **virtual** — nothing on disk
+     is moved or copied — and photos in an album disappear from Browse.
+   - **Ignoring junk:** the red-when-on buttons **Ignore FILE from future
+     scans** and **Ignore FOLDER from future scans** work as modes. Turn one
+     on, then every photo you click is ignored immediately, with no
+     confirmation (clicking does not open the preview while a mode is on).
+     Ignoring a folder also covers its sub-folders. **Undo last ignore**
+     reverses the most recent one; **Manage ignored…** lists everything
+     you've ignored and lets you bring items back.
 
-   **Ignoring junk:** the red-when-on buttons **Ignore FILE from future
-   scans** and **Ignore FOLDER from future scans** work as modes. Turn one
-   on, then every photo you click is ignored immediately, with no
-   confirmation, and the mode stays on until you turn it off. Ignoring a
-   folder also covers its sub-folders. Ignored photos disappear from every
-   tab and are skipped by future scans. **Undo last ignore** reverses the
-   most recent one; **Manage ignored…** lists everything you've ignored
-   and lets you bring items back.
+3. **Albums** — the directory of your albums (with photo counts), the photos
+   in the selected album, and the same enlarge-and-details panel. Rename an
+   album, delete an album (photos go back to Browse), or remove selected
+   photos from an album.
 
-3. **Duplicate Review** — the *only* place duplicate decisions happen, kept
-   deliberately separate from Browse so you're not scrolling past your
-   whole collection to deal with duplicates. Two sections:
-   - **Whole-folder duplicates**: if every photo in a folder already exists
-     elsewhere, it's shown as one row and **not** recommended for deletion
-     by default (it might be an intentional backup — you decide). If a
-     folder is *mostly* duplicated (more than half), the duplicated photos
-     are pre-checked for deletion and any genuinely unique photos in that
-     folder are called out separately so they're never accidentally lost.
-   - **Individual duplicate photos**: exact filename+size matches that
-     aren't part of a whole-folder match. The recommended keeper (based on
-     having camera metadata, living in an "organized" folder, size, and
-     age) is left unchecked; the others are pre-checked for deletion.
+4. **Duplicate Review** — the *only* place duplicate decisions happen, kept
+   deliberately separate from Browse. Duplicates are found from **metadata
+   only**: same **date taken + camera + file size** (so a renamed copy still
+   matches); photos with no camera data fall back to **file name + size**.
+   - **Click any file** to see all its copies side by side — thumbnails,
+     folder, name, size, dimensions, date taken, camera, created, modified —
+     with the differences highlighted.
+   - **Confirm** a group as real duplicates, or **Not duplicates — unflag**
+     it (it's taken off the list and never flagged again; *Reset my
+     confirm/unflag choices…* undoes that).
+   - **Whole-folder duplicates**: if every photo in a folder also exists in
+     another folder, it's one row, **not** recommended for deletion by
+     default (it might be an intentional backup). If a folder is *mostly*
+     duplicated (50% or more), its duplicated photos are pre-checked and the
+     unique ones are listed separately and never touched here. (Two copies in
+     the *same* folder are listed under *Individual duplicate photos*.)
+   - **Individual duplicate photos**: the recommended keeper (a copy already
+     in an album, camera metadata, an "organized" folder, size, age) is left
+     unchecked.
+   - **Quarantine selected folder…** moves a whole folder to a quarantine
+     location you pick the first time (nothing is deleted). **Quarantined
+     folders…** lists them with a **Restore** button. Pick a location on the
+     same drive as your photos so moving is instant. Quarantining moves
+     *everything* in that folder, including photos that aren't duplicates.
+   - **Safety:** the app never pre-checks, and refuses to apply, a selection
+     that would remove *every* copy of a photo (this matters when two folders
+     are each mostly duplicates of the other).
+   - Nothing is deleted until you click **Apply**, and even then files go to
+     the **Recycle Bin**, not permanent deletion.
 
-   Nothing is ever deleted until you click **Apply**, and even then files
-   go to the **Recycle Bin**, not permanent deletion — so a bad call is
-   always recoverable.
-
-4. **Visual Duplicates (Experimental)** — the stretch goal: finds photos
-   that look the same even when the filename/size don't match (a resized
-   copy, a re-saved copy, a screenshot of the same photo). Each group is
-   shown as photo cards side by side (real thumbnails, with name, folder,
-   dimensions and size) so you can compare them by eye; click a photo to
-   open it full size. This is a
-   separate, optional, slower pass using perceptual image hashing.
-   Nothing here is pre-checked for deletion — visual similarity is a
-   judgment call, not a certainty.
+5. **Visual Duplicates (Experimental)** — the stretch goal: finds photos
+   that look the same even when the metadata doesn't match (a resized copy, a
+   re-saved copy, a screenshot of the same photo). Each group is shown as photo
+   cards side by side so you can compare them by eye; click a photo to open it
+   full size. This is a separate, optional, slower pass using perceptual image
+   hashing. Nothing here is pre-checked for deletion.
 
 ## Customizing the rules
 
@@ -134,6 +158,12 @@ and thresholds there without touching any other file. A few examples:
   photos; measured at roughly 1.8 hours for 65,000 photos, during which the
   window is unresponsive. A smarter nearest-neighbor search (see
   `core/perceptual.py`) is the fix and has not been done yet.
+- **Metadata matching needs metadata.** Edited or re-saved copies (different
+  file size) won't match; that's what the Visual Duplicates tab is for. Photos
+  with no camera data only match when the file name is also the same.
+- **Created date** in the preview is the file system's creation time (accurate
+  on Windows). Copying a file usually resets it, which is why the album date
+  suggestion prefers the photo's own date taken when it has one.
 - **"Already organized" folder detection** is pattern-based (year/date-ish
   folder names). It's a reasonable first pass, not a guarantee — you can
   extend `ORGANIZED_FOLDER_PATTERNS` for your own naming habits.
@@ -151,12 +181,16 @@ core/
   scanner.py                   file system walk + indexing
   metadata.py                  EXIF extraction
   filters.py                   junk-file / organized-folder logic
-  duplicates.py                exact-ish duplicate + folder-level grouping
+  duplicates.py                metadata duplicate matching + folder-level grouping
+  albums.py                    album naming rules + name/date suggestions
+  quarantine.py                move a folder aside / restore it
+  fileinfo.py                  file size/date helpers
   perceptual.py                Phase 5: visual similarity (stretch goal)
   actions.py                   the only place files are deleted (Recycle Bin)
 gui/
   main_window.py                tab container
-  scan_tab.py / browse_tab.py / duplicate_review_tab.py / visual_duplicates_tab.py
+  scan_tab.py / browse_tab.py / albums_tab.py / duplicate_review_tab.py / visual_duplicates_tab.py
+  photo_grid.py / preview_panel.py / compare_panel.py / album_dialogs.py / quarantine_dialog.py
   thumbnails.py                 Pillow-based thumbnail generation
   workers.py                    background threads (scan, hashing)
 ```
