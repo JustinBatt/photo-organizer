@@ -63,7 +63,19 @@ The app has four tabs, meant to be used roughly in order:
 
 2. **Browse** — filter your indexed photos by folder, date range, or a
    text search on filename/path. Every thumbnail shows its source folder
-   path underneath it.
+   path underneath it, and the full path of whatever you point at appears
+   at the bottom. The whole collection is one scrollable list (tens of
+   thousands of photos are fine); thumbnails are loaded in the background
+   only for what's on screen.
+
+   **Ignoring junk:** the red-when-on buttons **Ignore FILE from future
+   scans** and **Ignore FOLDER from future scans** work as modes. Turn one
+   on, then every photo you click is ignored immediately, with no
+   confirmation, and the mode stays on until you turn it off. Ignoring a
+   folder also covers its sub-folders. Ignored photos disappear from every
+   tab and are skipped by future scans. **Undo last ignore** reverses the
+   most recent one; **Manage ignored…** lists everything you've ignored
+   and lets you bring items back.
 
 3. **Duplicate Review** — the *only* place duplicate decisions happen, kept
    deliberately separate from Browse so you're not scrolling past your
@@ -85,7 +97,10 @@ The app has four tabs, meant to be used roughly in order:
 
 4. **Visual Duplicates (Experimental)** — the stretch goal: finds photos
    that look the same even when the filename/size don't match (a resized
-   copy, a re-saved copy, a screenshot of the same photo). This is a
+   copy, a re-saved copy, a screenshot of the same photo). Each group is
+   shown as photo cards side by side (real thumbnails, with name, folder,
+   dimensions and size) so you can compare them by eye; click a photo to
+   open it full size. This is a
    separate, optional, slower pass using perceptual image hashing.
    Nothing here is pre-checked for deletion — visual similarity is a
    judgment call, not a certainty.
@@ -110,15 +125,15 @@ and thresholds there without touching any other file. A few examples:
 - **HEIC/HEIF support** depends on the `pillow-heif` package installing
   cleanly on your machine. If it doesn't, HEIC files are still indexed by
   extension but may show a blank thumbnail and no EXIF.
-- **Thumbnails load synchronously** in Browse, capped at 200 per page with
-  a "Load more" button. On a very large, high-resolution collection this
-  is the first thing worth optimizing (background thumbnail loading +
-  caching) if it feels slow.
+- **Browse thumbnails are cached in memory only** (the most recent ~4,000),
+  so scrolling back over a very large collection re-decodes thumbnails
+  that were evicted. A thumbnail cache on disk would fix that if it ever
+  feels slow.
 - **Visual duplicate matching is O(n²)** (compares every hashed photo to
-  every other). Fine for a few thousand photos; a very large library
-  (tens of thousands+) would benefit from a smarter nearest-neighbor
-  search — flagged in the code (`core/perceptual.py`) as a future
-  optimization rather than solved now.
+  every other) and runs on the main window thread. Fine for a few thousand
+  photos; measured at roughly 1.8 hours for 65,000 photos, during which the
+  window is unresponsive. A smarter nearest-neighbor search (see
+  `core/perceptual.py`) is the fix and has not been done yet.
 - **"Already organized" folder detection** is pattern-based (year/date-ish
   folder names). It's a reasonable first pass, not a guarantee — you can
   extend `ORGANIZED_FOLDER_PATTERNS` for your own naming habits.

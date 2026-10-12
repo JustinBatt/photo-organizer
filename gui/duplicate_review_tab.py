@@ -3,7 +3,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTreeWidget,
     QTreeWidgetItem, QLabel, QMessageBox, QSplitter
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 
 from core.duplicates import (
     build_duplicate_groups, build_folder_groups, individual_only_groups,
@@ -20,6 +20,9 @@ class DuplicateReviewTab(QWidget):
     A dedicated tab that ONLY deals with duplicate survivorship - the
     rest of the collection never appears here, by design.
     """
+
+    # Emitted after files were moved to the Recycle Bin, so other tabs can refresh.
+    files_deleted = Signal()
 
     def __init__(self, db):
         super().__init__()
@@ -220,3 +223,5 @@ class DuplicateReviewTab(QWidget):
         QMessageBox.information(self, "Done", msg)
 
         self.refresh_all()
+        if succeeded:
+            self.files_deleted.emit()

@@ -2,10 +2,16 @@
 Thin SQLite wrapper. Keeps scan results on disk so re-opening the app
 or re-filtering doesn't require re-walking the whole file system.
 """
+import os
 import sqlite3
 import threading
-from pathlib import Path
+from datetime import datetime
 from typing import Iterable, Optional, Any
+
+
+def normalize_path(path) -> str:
+    """Canonical form used to compare paths (case-insensitive on Windows)."""
+    return os.path.normcase(os.path.normpath(str(path)))
 
 
 SCHEMA = """
@@ -38,6 +44,7 @@ CREATE TABLE IF NOT EXISTS photos (
     dup_group_key TEXT,
     dup_folder_status TEXT,
     phash TEXT,
+    ignored INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (scan_id) REFERENCES scans (id)
 );
 
@@ -52,6 +59,16 @@ CREATE TABLE IF NOT EXISTS actions_log (
     action TEXT NOT NULL,
     reason TEXT,
     performed_at TEXT NOT NULL
+);
+
+-- Files/folders the user chose to ignore ("by file" / "by folder").
+-- A folder rule also covers every sub-folder beneath it.
+CREATE TABLE IF NOT EXISTS ignore_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL CHECK (kind IN ('file', 'folder')),
+    path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (kind, path)
 );
 """
 
@@ -73,7 +90,17 @@ class Database:
 
         conn = self.conn  # creates this (the calling) thread's connection
         conn.executescript(SCHEMA)
+        self._migrate(conn)
         conn.commit()
+
+    def _migrate(self, conn: sqlite3.Connection):
+        """Upgrade a database file created by an older version of the app."""
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(photos)")}
+        if "ignored" not in cols:
+            conn.execute(
+                "ALTER TABLE photos ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0"
+            )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_ignored ON photos (ignored)")
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -141,6 +168,65 @@ class Database:
             self.conn.execute("DELETE FROM photos WHERE scan_id = ?", (scan_id,))
         self.conn.commit()
 
+    # --- ignore rules ------------------------------------------------
+
+    def _apply_rule(self, kind: str, path: str) -> int:
+        """Flag matching photos as ignored. Returns how many were newly hidden."""
+        if kind == "file":
+            cur = self.conn.execute(
+                "UPDATE photos SET ignored = 1 WHERE ignored = 0 AND path = ?",
+                (path,),
+            )
+        else:
+            # The folder itself, or anything beneath it (prefix match with a
+            # separator so "Screenshots" never matches "Screenshots 2").
+            prefix = path.rstrip("\\/") + os.sep
+            cur = self.conn.execute(
+                "UPDATE photos SET ignored = 1 WHERE ignored = 0 AND "
+                "(folder = ? COLLATE NOCASE OR substr(folder, 1, ?) = ? COLLATE NOCASE)",
+                (path, len(prefix), prefix),
+            )
+        return cur.rowcount
+
+    def add_ignore_rule(self, kind: str, path: str) -> int:
+        """Ignore a file or folder from now on. Returns photos newly hidden."""
+        if kind not in ("file", "folder"):
+            raise ValueError(f"unknown ignore kind: {kind}")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO ignore_rules (kind, path, created_at) VALUES (?, ?, ?)",
+            (kind, path, datetime.now().isoformat()),
+        )
+        hidden = self._apply_rule(kind, path)
+        self.conn.commit()
+        return hidden
+
+    def remove_ignore_rule(self, kind: str, path: str):
+        """Stop ignoring. Photos covered by another remaining rule stay hidden."""
+        self.conn.execute(
+            "DELETE FROM ignore_rules WHERE kind = ? AND path = ?", (kind, path)
+        )
+        self.conn.execute("UPDATE photos SET ignored = 0")
+        for rule in self.conn.execute("SELECT kind, path FROM ignore_rules").fetchall():
+            self._apply_rule(rule["kind"], rule["path"])
+        self.conn.commit()
+
+    def list_ignore_rules(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT kind, path, created_at FROM ignore_rules ORDER BY id DESC"
+        ).fetchall()
+
+    def ignore_sets(self) -> tuple[set[str], list[str]]:
+        """(normalized ignored file paths, normalized ignored folder paths)
+        for the scanner to skip."""
+        files: set[str] = set()
+        folders: list[str] = []
+        for rule in self.conn.execute("SELECT kind, path FROM ignore_rules"):
+            if rule["kind"] == "file":
+                files.add(normalize_path(rule["path"]))
+            else:
+                folders.append(normalize_path(rule["path"]))
+        return files, folders
+
     # --- photos ------------------------------------------------------
 
     def upsert_photo(self, record: dict[str, Any]):
@@ -166,7 +252,7 @@ class Database:
         if include_excluded:
             return self.conn.execute("SELECT * FROM photos").fetchall()
         return self.conn.execute(
-            "SELECT * FROM photos WHERE excluded = 0"
+            "SELECT * FROM photos WHERE excluded = 0 AND ignored = 0"
         ).fetchall()
 
     def excluded_photos(self) -> list[sqlite3.Row]:
@@ -176,7 +262,8 @@ class Database:
 
     def distinct_folders(self) -> list[str]:
         rows = self.conn.execute(
-            "SELECT DISTINCT folder FROM photos WHERE excluded = 0 ORDER BY folder"
+            "SELECT DISTINCT folder FROM photos "
+            "WHERE excluded = 0 AND ignored = 0 ORDER BY folder"
         ).fetchall()
         return [r["folder"] for r in rows]
 
@@ -187,7 +274,7 @@ class Database:
         date_to: Optional[str] = None,
         search_text: Optional[str] = None,
     ) -> list[sqlite3.Row]:
-        query = "SELECT * FROM photos WHERE excluded = 0"
+        query = "SELECT * FROM photos WHERE excluded = 0 AND ignored = 0"
         params: list[Any] = []
         if folder:
             query += " AND folder = ?"
@@ -224,8 +311,8 @@ class Database:
 
     def duplicate_groups(self) -> dict[str, list[sqlite3.Row]]:
         rows = self.conn.execute(
-            "SELECT * FROM photos WHERE excluded = 0 AND dup_group_key IS NOT NULL "
-            "ORDER BY dup_group_key"
+            "SELECT * FROM photos WHERE excluded = 0 AND ignored = 0 "
+            "AND dup_group_key IS NOT NULL ORDER BY dup_group_key"
         ).fetchall()
         groups: dict[str, list[sqlite3.Row]] = {}
         for row in rows:
@@ -237,7 +324,7 @@ class Database:
             "SELECT folder, "
             "COUNT(*) AS total, "
             "SUM(CASE WHEN dup_group_key IS NOT NULL THEN 1 ELSE 0 END) AS duped "
-            "FROM photos WHERE excluded = 0 GROUP BY folder"
+            "FROM photos WHERE excluded = 0 AND ignored = 0 GROUP BY folder"
         ).fetchall()
         return {
             r["folder"]: {"total": r["total"], "duped": r["duped"]} for r in rows

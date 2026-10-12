@@ -1,4 +1,5 @@
-from PySide6.QtWidgets import QMainWindow, QTabWidget
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QApplication, QMainWindow, QTabWidget
 
 from core.database import Database
 from core import config
@@ -16,26 +17,71 @@ class MainWindow(QMainWindow):
 
         self.db = Database(db_path)
 
-        tabs = QTabWidget()
+        self.tabs = QTabWidget()
         self.scan_tab = ScanTab(self.db, on_scan_complete=self.on_scan_complete)
         self.browse_tab = BrowseTab(self.db)
         self.review_tab = DuplicateReviewTab(self.db)
         self.visual_tab = VisualDuplicatesTab(self.db)
 
-        tabs.addTab(self.scan_tab, "1. Scan")
-        tabs.addTab(self.browse_tab, "2. Browse")
-        tabs.addTab(self.review_tab, "3. Duplicate Review")
-        tabs.addTab(self.visual_tab, "4. Visual Duplicates (Experimental)")
+        self.tabs.addTab(self.scan_tab, "1. Scan")
+        self.tabs.addTab(self.browse_tab, "2. Browse")
+        self.tabs.addTab(self.review_tab, "3. Duplicate Review")
+        self.tabs.addTab(self.visual_tab, "4. Visual Duplicates (Experimental)")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
-        self.setCentralWidget(tabs)
+        self.setCentralWidget(self.tabs)
 
-        # If a previous scan's DB already has data, populate views on launch.
-        self.on_scan_complete()
+        # The duplicate view is rebuilt lazily - only when it is opened after
+        # something changed - so launching with a large collection stays fast.
+        self._review_stale = True
+        self._browse_stale = False
+
+        # Keep the tabs consistent with each other.
+        self.browse_tab.ignores_changed.connect(self._mark_review_stale)
+        self.review_tab.files_deleted.connect(self._mark_browse_stale)
+        self.visual_tab.files_deleted.connect(self._mark_browse_stale)
+        self.visual_tab.files_deleted.connect(self._mark_review_stale)
+
+        # If a previous scan's DB already has data, populate the browse view on launch.
+        self.browse_tab.refresh_folder_list()
 
     def on_scan_complete(self):
         self.browse_tab.refresh_folder_list()
-        self.review_tab.refresh_all()
+        self._mark_review_stale()
+
+    # --- keeping tabs in sync ---------------------------------------------
+
+    def _mark_review_stale(self):
+        self._review_stale = True
+        if self.tabs.currentWidget() is self.review_tab:
+            self._refresh_review()
+
+    def _mark_browse_stale(self):
+        self._browse_stale = True
+        if self.tabs.currentWidget() is self.browse_tab:
+            self._refresh_browse()
+
+    def _refresh_review(self):
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.review_tab.refresh_all()
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._review_stale = False
+
+    def _refresh_browse(self):
+        self.browse_tab.refresh_folder_list()
+        self._browse_stale = False
+
+    def _on_tab_changed(self, _index: int):
+        current = self.tabs.currentWidget()
+        if current is self.review_tab and self._review_stale:
+            self._refresh_review()
+        elif current is self.browse_tab and self._browse_stale:
+            self._refresh_browse()
 
     def closeEvent(self, event):
+        self.browse_tab.shutdown()
+        self.visual_tab.shutdown()
         self.db.close()
         event.accept()
