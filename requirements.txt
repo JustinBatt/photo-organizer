@@ -1,0 +1,5 @@
+PySide6>=6.5
+Pillow>=10.0
+send2trash>=1.8
+imagehash>=4.3
+pillow-heif>=0.13
