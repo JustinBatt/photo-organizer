@@ -3,6 +3,7 @@ Thin SQLite wrapper. Keeps scan results on disk so re-opening the app
 or re-filtering doesn't require re-walking the whole file system.
 """
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Iterable, Optional, Any
 
@@ -56,15 +57,64 @@ CREATE TABLE IF NOT EXISTS actions_log (
 
 
 class Database:
+    """
+    SQLite connections can only be used on the thread that created them,
+    but the GUI runs scans/hashing on background QThreads. So instead of
+    one shared connection, every thread that touches the database gets its
+    own connection to the same file, created on demand (see `conn`).
+    WAL mode lets the GUI thread keep reading while a worker is writing.
+    """
+
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(SCHEMA)
-        self.conn.commit()
+        self._local = threading.local()
+        self._all_conns: list[sqlite3.Connection] = []
+        self._conns_lock = threading.Lock()
+
+        conn = self.conn  # creates this (the calling) thread's connection
+        conn.executescript(SCHEMA)
+        conn.commit()
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """The current thread's own connection (created on first use)."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn.row_factory = sqlite3.Row
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.DatabaseError:
+                pass  # e.g. a filesystem without WAL support - fall back silently
+            self._local.conn = conn
+            with self._conns_lock:
+                self._all_conns.append(conn)
+        return conn
+
+    def close_thread_connection(self):
+        """Call from a worker thread when it is done, to release its connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        self._local.conn = None
+        with self._conns_lock:
+            if conn in self._all_conns:
+                self._all_conns.remove(conn)
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
 
     def close(self):
-        self.conn.close()
+        """Close every connection (called once, when the app exits)."""
+        with self._conns_lock:
+            conns, self._all_conns = self._all_conns, []
+        for conn in conns:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+        self._local.conn = None
 
     # --- scans -----------------------------------------------------
 

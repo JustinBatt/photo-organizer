@@ -32,6 +32,8 @@ class ScanWorker(QThread):
             self.finished_scan.emit(count)
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            self.db.close_thread_connection()  # release this thread's connection
 
 
 class HashWorker(QThread):
@@ -57,3 +59,5 @@ class HashWorker(QThread):
             self.finished_hashing.emit(count)
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            self.db.close_thread_connection()  # release this thread's connection
