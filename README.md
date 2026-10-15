@@ -71,14 +71,23 @@ The app has five tabs, meant to be used roughly in order:
    - **Click a photo** to enlarge it in the side panel, with its full file
      path, size, created date, modified date, dimensions, date taken and
      camera. Double-click opens it in your normal photo viewer.
-   - **Albums:** select photos (click, Ctrl-click, Shift-click, or *Select all
-     shown*) and click **Create album from selected…**. The album name is
-     `date prefix + name`: the prefix is suggested from when the photos were
-     taken (`YY_MM`, e.g. `23_06`, or year-only), and the name from the
-     folder the photos are in. Both can be edited, and a name without a date
-     prefix is refused. **Add selected to album…** shows your list of
-     existing albums to pick from. Albums are **virtual** — nothing on disk
-     is moved or copied — and photos in an album disappear from Browse.
+   - **Star ratings (1–5):** hover over any photo and five stars pop up on it —
+     click one to rate it (click the same star again to clear). Or just
+     type **1–5** while the mouse is over a photo (**0** clears); with the mouse
+     off the grid, the keys rate the selected photos. Rated photos keep a small
+     star badge, and the **Rating** filter at the top narrows the list to
+     unrated photos or "★★★ and up". Typing in the search box never rates anything.
+   - **Albums:** the album list is always visible on the left, as a tree, so
+     sub-albums show up while you sort. File photos by **dragging them onto an
+     album**, by selecting photos and **double-clicking an album**, or with
+     **Add selected to album…**, a single window where you either pick an
+     existing album or create a new one (a date prefix like `23_06` is
+     *recommended* from the photos' date taken, and the name is suggested from
+     their folder — but both are optional and editable). To make a
+     **sub-album**, pick the parent in that window and tick "Inside the
+     selected album", or type a name with `/` in it (e.g. `23_06 Trip/Day 1`).
+     Albums are **virtual** — nothing on disk is moved or copied — and photos
+     in an album disappear from Browse.
    - **Ignoring junk:** the red-when-on buttons **Ignore FILE from future
      scans** and **Ignore FOLDER from future scans** work as modes. Turn one
      on, then every photo you click is ignored immediately, with no
@@ -87,10 +96,12 @@ The app has five tabs, meant to be used roughly in order:
      reverses the most recent one; **Manage ignored…** lists everything
      you've ignored and lets you bring items back.
 
-3. **Albums** — the directory of your albums (with photo counts), the photos
-   in the selected album, and the same enlarge-and-details panel. Rename an
-   album, delete an album (photos go back to Browse), or remove selected
-   photos from an album.
+3. **Albums** — your albums as a tree (counts include sub-albums), the photos
+   in the selected album (optionally including its sub-albums), and the same
+   enlarge-and-details panel and star ratings. Create albums/sub-albums,
+   rename or move an album (its sub-albums follow), delete an album and its
+   sub-albums (photos go back to Browse), or remove selected photos from an
+   album.
 
 4. **Duplicate Review** — the *only* place duplicate decisions happen, kept
    deliberately separate from Browse. Duplicates are found from **metadata
@@ -102,6 +113,11 @@ The app has five tabs, meant to be used roughly in order:
    - **Confirm** a group as real duplicates, or **Not duplicates — unflag**
      it (it's taken off the list and never flagged again; *Reset my
      confirm/unflag choices…* undoes that).
+   - The folder list shows, per folder: **Photos** in it, its **Sub-folders**
+     that hold photos (and how many photos they hold — these move along if you
+     quarantine the folder), how many photos are **Duplicated elsewhere**
+     (count and %), and how many are **Unique**. Each duplicated file says
+     which other folder(s) it also lives in.
    - **Whole-folder duplicates**: if every photo in a folder also exists in
      another folder, it's one row, **not** recommended for deletion by
      default (it might be an intentional backup). If a folder is *mostly*
@@ -109,7 +125,7 @@ The app has five tabs, meant to be used roughly in order:
      unique ones are listed separately and never touched here. (Two copies in
      the *same* folder are listed under *Individual duplicate photos*.)
    - **Individual duplicate photos**: the recommended keeper (a copy already
-     in an album, camera metadata, an "organized" folder, size, age) is left
+     in an album, a higher star rating, camera metadata, an "organized" folder, size, age) is left
      unchecked.
    - **Quarantine selected folder…** moves a whole folder to a quarantine
      location you pick the first time (nothing is deleted). **Quarantined

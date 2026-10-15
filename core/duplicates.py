@@ -109,7 +109,7 @@ def build_duplicate_groups(db: Database) -> list[DupGroupRecommendation]:
         ranked = sorted(
             rows,
             key=lambda r: (
-                r["path"] not in albumed, -_score_photo(r), -r["size"],
+                r["path"] not in albumed, -r["rating"], -_score_photo(r), -r["size"],
                 r["modified_time"], r["path"],
             ),
         )
@@ -124,9 +124,11 @@ def build_duplicate_groups(db: Database) -> list[DupGroupRecommendation]:
                 bits.append("has camera metadata")
             if row["path"] in albumed:
                 bits.append("already in an album")
+            if row["rating"]:
+                bits.append("rated " + "★" * row["rating"])
             if row["is_organized_folder"]:
                 bits.append("in an organized folder")
-            if not row["has_exif"] and not row["is_organized_folder"] and row["path"] not in albumed:
+            if not row["has_exif"] and not row["is_organized_folder"] and row["path"] not in albumed and not row["rating"]:
                 bits.append("no metadata, unorganized folder")
             reasons[row["path"]] = ", ".join(bits) if bits else "—"
 
@@ -165,6 +167,28 @@ class FolderGroupRecommendation:
     recommendation: str  # human-readable
     duplicated_photo_paths: list[str] = field(default_factory=list)
     unique_photo_paths: list[str] = field(default_factory=list)
+    # Sub-folders (anywhere beneath this folder) that hold indexed photos, and how
+    # many photos those hold. A quarantine moves these along with the folder.
+    subfolder_count: int = 0
+    subfolder_photos: int = 0
+
+
+def folder_descendants(photo_counts: dict[str, int]) -> dict[str, tuple[set, int]]:
+    """For each folder (lower-cased): (the sub-folders beneath it that hold photos,
+    total photos in them). `photo_counts` maps folder -> photos directly in it."""
+    import os
+    stats: dict[str, tuple[set, int]] = {}
+    for folder, count in photo_counts.items():
+        current = folder
+        while True:
+            parent = os.path.dirname(current)
+            if not parent or parent == current:
+                break
+            subs, total = stats.get(parent.lower(), (set(), 0))
+            subs.add(folder.lower())
+            stats[parent.lower()] = (subs, total + count)
+            current = parent
+    return stats
 
 
 def build_folder_groups(
@@ -182,6 +206,9 @@ def build_folder_groups(
     for row in db.all_photos(include_excluded=False):
         photos_by_folder.setdefault(row["folder"], []).append(row)
 
+    sub_stats = folder_descendants(
+        {folder: len(rows) for folder, rows in photos_by_folder.items()}
+    )
     results: list[FolderGroupRecommendation] = []
 
     for folder, folder_rows in photos_by_folder.items():
@@ -219,6 +246,8 @@ def build_folder_groups(
                 recommendation=recommendation,
                 duplicated_photo_paths=dup_paths,
                 unique_photo_paths=unique_paths,
+                subfolder_count=len(sub_stats.get(folder.lower(), (set(), 0))[0]),
+                subfolder_photos=sub_stats.get(folder.lower(), (set(), 0))[1],
             )
         )
 

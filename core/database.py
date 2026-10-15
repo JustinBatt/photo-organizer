@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS photos (
     phash TEXT,
     ignored INTEGER NOT NULL DEFAULT 0,
     quarantined INTEGER NOT NULL DEFAULT 0,
+    rating INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (scan_id) REFERENCES scans (id)
 );
 
@@ -150,7 +151,7 @@ class Database:
         if not exists:
             return
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(photos)")}
-        for name in ("ignored", "quarantined"):
+        for name in ("ignored", "quarantined", "rating"):
             if name not in cols:
                 conn.execute(
                     f"ALTER TABLE photos ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
@@ -343,7 +344,9 @@ class Database:
         date_to: Optional[str] = None,
         search_text: Optional[str] = None,
         hide_albumed: bool = True,
+        rating_filter: Optional[int] = None,
     ) -> list[sqlite3.Row]:
+        """rating_filter: None = any, 0 = unrated only, 1-5 = that many stars or more."""
         query = f"SELECT * FROM photos WHERE {_VISIBLE}"
         params: list[Any] = []
         if hide_albumed:
@@ -351,6 +354,12 @@ class Database:
         if folder:
             query += " AND folder = ?"
             params.append(folder)
+        if rating_filter is not None:
+            if rating_filter <= 0:
+                query += " AND rating = 0"
+            else:
+                query += " AND rating >= ?"
+                params.append(rating_filter)
         if date_from:
             query += " AND COALESCE(date_taken, date(modified_time, 'unixepoch')) >= ?"
             params.append(date_from)
@@ -385,18 +394,38 @@ class Database:
         ).fetchone()
 
     # --- albums (virtual: nothing on disk moves) --------------------------
+    #
+    # Albums form a hierarchy through "/" in their name: "23_06 Trip/Day 1" is
+    # a sub-album of "23_06 Trip". Creating an album also creates every parent
+    # level, so the tree is always complete.
+
+    @staticmethod
+    def _is_inside(name: str, parent: str) -> bool:
+        """True if album `name` is `parent` or lives somewhere beneath it."""
+        n, p = name.lower(), parent.lower()
+        return n == p or n.startswith(p + "/")
+
+    def _insert_album(self, name: str) -> Optional[int]:
+        now = datetime.now().isoformat()
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO albums (name, created_at) VALUES (?, ?)", (name, now)
+        )
+        return cur.lastrowid if cur.rowcount else None
+
+    def _ensure_ancestors(self, name: str):
+        parts = name.split("/")
+        for i in range(1, len(parts)):
+            self._insert_album("/".join(parts[:i]))
 
     def create_album(self, name: str) -> int:
-        """Create an album. Raises ValueError if the name is already taken."""
-        try:
-            cur = self.conn.execute(
-                "INSERT INTO albums (name, created_at) VALUES (?, ?)",
-                (name, datetime.now().isoformat()),
-            )
-        except sqlite3.IntegrityError:
+        """Create an album (and any missing parents). ValueError if it exists."""
+        self._ensure_ancestors(name)
+        album_id = self._insert_album(name)
+        if album_id is None:
+            self.conn.rollback()
             raise ValueError(f'An album named "{name}" already exists.')
         self.conn.commit()
-        return cur.lastrowid
+        return album_id
 
     def album_id_by_name(self, name: str) -> Optional[int]:
         row = self.conn.execute(
@@ -404,31 +433,79 @@ class Database:
         ).fetchone()
         return row["id"] if row else None
 
-    def list_albums(self) -> list[sqlite3.Row]:
-        """All albums with how many visible photos each holds (name order)."""
-        return self.conn.execute(
-            "SELECT a.id, a.name, a.created_at, COUNT(p.id) AS photo_count "
-            "FROM albums a "
-            "LEFT JOIN album_photos ap ON ap.album_id = a.id "
-            "LEFT JOIN photos p ON p.path = ap.path "
-            "  AND p.excluded = 0 AND p.ignored = 0 AND p.quarantined = 0 "
-            "GROUP BY a.id ORDER BY a.name COLLATE NOCASE"
+    def album_name(self, album_id: int) -> Optional[str]:
+        row = self.conn.execute("SELECT name FROM albums WHERE id = ?", (album_id,)).fetchone()
+        return row["name"] if row else None
+
+    def list_albums(self) -> list[dict]:
+        """Every album, in name order (so parents come before their children), with
+        photo_count (directly in it) and total_count (it plus all sub-albums,
+        each photo counted once)."""
+        albums = self.conn.execute(
+            "SELECT id, name, created_at FROM albums ORDER BY name COLLATE NOCASE"
         ).fetchall()
+        members: dict[int, set] = {}
+        for r in self.conn.execute(
+            "SELECT ap.album_id, ap.path FROM album_photos ap JOIN photos p ON p.path = ap.path "
+            "WHERE p.excluded = 0 AND p.ignored = 0 AND p.quarantined = 0"
+        ):
+            members.setdefault(r["album_id"], set()).add(r["path"])
+        by_name = {a["name"].lower(): a["id"] for a in albums}
+        totals: dict[int, set] = {a["id"]: set(members.get(a["id"], ())) for a in albums}
+        for a in albums:
+            own = members.get(a["id"])
+            if not own:
+                continue
+            parts = a["name"].lower().split("/")
+            for i in range(1, len(parts)):
+                parent_id = by_name.get("/".join(parts[:i]))
+                if parent_id is not None:
+                    totals[parent_id] |= own
+        return [
+            {"id": a["id"], "name": a["name"], "created_at": a["created_at"],
+             "photo_count": len(members.get(a["id"], ())), "total_count": len(totals[a["id"]])}
+            for a in albums
+        ]
+
+    def album_subtree(self, album_id: int) -> list[sqlite3.Row]:
+        """The album itself plus every album beneath it."""
+        name = self.album_name(album_id)
+        if name is None:
+            return []
+        return [r for r in self.conn.execute("SELECT id, name FROM albums").fetchall()
+                if self._is_inside(r["name"], name)]
 
     def rename_album(self, album_id: int, new_name: str):
-        try:
-            self.conn.execute(
-                "UPDATE albums SET name = ? WHERE id = ?", (new_name, album_id)
-            )
-        except sqlite3.IntegrityError:
-            raise ValueError(f'An album named "{new_name}" already exists.')
+        """Rename (or move) an album; its sub-albums follow it."""
+        old = self.album_name(album_id)
+        if old is None:
+            raise ValueError("That album no longer exists.")
+        if self._is_inside(new_name, old) and new_name.lower() != old.lower():
+            raise ValueError("An album can't be moved inside itself.")
+        subtree = self.album_subtree(album_id)
+        in_tree = {r["id"] for r in subtree}
+        others = {r["name"].lower() for r in self.conn.execute("SELECT id, name FROM albums")
+                  if r["id"] not in in_tree}
+        renames = [(r["id"], new_name + r["name"][len(old):]) for r in subtree]
+        for _id, target in renames:
+            if target.lower() in others:
+                raise ValueError(f'An album named "{target}" already exists.')
+        self._ensure_ancestors(new_name)
+        # two passes so a rename like "A" -> "A2" never collides mid-way
+        for _id, target in renames:
+            self.conn.execute("UPDATE albums SET name = ? WHERE id = ?", (f"\u0001moving-{_id}", _id))
+        for _id, target in renames:
+            self.conn.execute("UPDATE albums SET name = ? WHERE id = ?", (target, _id))
         self.conn.commit()
 
-    def delete_album(self, album_id: int):
-        """Delete the album only - its photos are untouched and return to Browse."""
-        self.conn.execute("DELETE FROM album_photos WHERE album_id = ?", (album_id,))
-        self.conn.execute("DELETE FROM albums WHERE id = ?", (album_id,))
+    def delete_album(self, album_id: int) -> int:
+        """Delete the album and its sub-albums (never the photos). Returns how
+        many albums were removed."""
+        ids = [r["id"] for r in self.album_subtree(album_id)]
+        self.conn.executemany("DELETE FROM album_photos WHERE album_id = ?", [(i,) for i in ids])
+        self.conn.executemany("DELETE FROM albums WHERE id = ?", [(i,) for i in ids])
         self.conn.commit()
+        return len(ids)
 
     def add_photos_to_album(self, album_id: int, paths: Iterable[str]) -> int:
         """Returns how many photos were newly added (already-present ones skipped)."""
@@ -441,21 +518,40 @@ class Database:
         self.conn.commit()
         return self.conn.total_changes - before
 
-    def remove_photos_from_album(self, album_id: int, paths: Iterable[str]):
+    def remove_photos_from_album(self, album_id: int, paths: Iterable[str],
+                                 include_sub: bool = False):
+        ids = [r["id"] for r in self.album_subtree(album_id)] if include_sub else [album_id]
+        paths = list(paths)
         self.conn.executemany(
             "DELETE FROM album_photos WHERE album_id = ? AND path = ?",
-            [(album_id, p) for p in paths],
+            [(i, p) for i in ids for p in paths],
         )
         self.conn.commit()
 
-    def album_photos(self, album_id: int) -> list[sqlite3.Row]:
-        return self.conn.execute(
-            "SELECT p.* FROM album_photos ap JOIN photos p ON p.path = ap.path "
-            "WHERE ap.album_id = ? AND p.excluded = 0 AND p.ignored = 0 "
-            "AND p.quarantined = 0 "
-            "ORDER BY COALESCE(p.date_taken, '') ASC, p.modified_time ASC",
-            (album_id,),
-        ).fetchall()
+    def album_photos(self, album_id: int, include_sub: bool = False) -> list[sqlite3.Row]:
+        ids = [r["id"] for r in self.album_subtree(album_id)] if include_sub else [album_id]
+        rows: dict[str, sqlite3.Row] = {}
+        for i in ids:
+            for r in self.conn.execute(
+                "SELECT p.* FROM album_photos ap JOIN photos p ON p.path = ap.path "
+                "WHERE ap.album_id = ? AND p.excluded = 0 AND p.ignored = 0 "
+                "AND p.quarantined = 0", (i,)
+            ):
+                rows.setdefault(r["path"], r)
+        return sorted(rows.values(), key=lambda r: (r["date_taken"] or "", r["modified_time"]))
+
+    # --- ratings --------------------------------------------------------------
+
+    def set_rating(self, path: str, rating: int):
+        self.conn.execute("UPDATE photos SET rating = ? WHERE path = ?",
+                          (max(0, min(5, int(rating))), path))
+        self.conn.commit()
+
+    def set_ratings(self, paths: Iterable[str], rating: int):
+        r = max(0, min(5, int(rating)))
+        self.conn.executemany("UPDATE photos SET rating = ? WHERE path = ?",
+                              [(r, p) for p in paths])
+        self.conn.commit()
 
     def albumed_paths(self) -> set[str]:
         return {r["path"] for r in self.conn.execute("SELECT DISTINCT path FROM album_photos")}

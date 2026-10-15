@@ -26,7 +26,7 @@ _DATE_PREFIX_RE = re.compile(
     rf"(?=[\s_\-.]|$)[\s_\-.]*"
 )
 _VALID_NAME_RE = re.compile(r"^(?:\d{2}_(?:0[1-9]|1[0-2])|(?:19|20)\d{2}) \S.*$")
-_ILLEGAL_CHARS = set('<>:"/\\|?*')
+_ILLEGAL_CHARS = set('<>:"\\|?*')  # "/" is the level separator, handled separately
 MAX_NAME_LENGTH = 100
 SAMPLE_LIMIT = 500  # photos examined (on disk) when suggesting a prefix
 
@@ -36,36 +36,53 @@ def strip_date_prefix(name: str) -> str:
     return _DATE_PREFIX_RE.sub("", name, count=1).strip()
 
 
+def normalize_album_path(text: str) -> str:
+    """Tidy what the user typed: '\\' counts as '/', spaces around levels are dropped,
+    empty levels disappear.   ' Trip / Day 1 ' -> 'Trip/Day 1'"""
+    parts = [p.strip() for p in text.replace("\\", "/").split("/")]
+    return "/".join(p for p in parts if p)
+
+
 def validate_album_name(name: str) -> Optional[str]:
-    """None if the name is acceptable, otherwise a message saying what's wrong."""
+    """None if the album name (optionally 'Parent/Child/...') is acceptable,
+    otherwise a message saying what's wrong. A date prefix is NOT required."""
     if not name or not name.strip():
         return "Enter an album name."
-    if name != name.strip():
-        return "Remove the spaces at the start or end of the name."
-    if len(name) > MAX_NAME_LENGTH:
-        return f"Keep the name under {MAX_NAME_LENGTH} characters."
-    bad = sorted({c for c in name if c in _ILLEGAL_CHARS or ord(c) < 32})
-    if bad:
-        shown = " ".join(c for c in bad if ord(c) >= 32)
-        return f"These characters aren't allowed: {shown}" if shown else "Remove the control characters."
-    if name.endswith(".") or name.endswith(" "):
-        return "The name can't end with a dot."
-    if not _VALID_NAME_RE.match(name):
-        return ("Start with a date prefix, then a space and a name — "
-                "for example  23_06 Beach Weekend  (YY_MM) or  2023 Beach Weekend.")
+    if len(name) > MAX_NAME_LENGTH * 2:
+        return "That name is too long."
+    for part in name.split("/"):
+        if not part.strip():
+            return "Remove the empty level (two slashes in a row, or a slash at the start/end)."
+        if part != part.strip():
+            return "Remove the spaces at the start or end of a level."
+        if len(part) > MAX_NAME_LENGTH:
+            return f"Keep each level under {MAX_NAME_LENGTH} characters."
+        bad = sorted({c for c in part if c in _ILLEGAL_CHARS or ord(c) < 32})
+        if bad:
+            shown = " ".join(c for c in bad if ord(c) >= 32)
+            return f"These characters aren't allowed: {shown}" if shown else "Remove the control characters."
+        if part.endswith("."):
+            return "A level can't end with a dot."
     return None
 
 
-def compose_album_name(prefix: str, name: str) -> str:
-    return f"{prefix.strip()} {name.strip()}".strip()
+def has_date_prefix(name: str) -> bool:
+    """True if the top-level part of an album name starts with a YY_MM / year prefix."""
+    return bool(_VALID_NAME_RE.match(name.split("/")[0]))
 
 
-def split_album_name(album_name: str) -> tuple[str, str]:
-    """('23_06', 'Beach Weekend') for a valid name; ('', name) otherwise."""
-    prefix, _, rest = album_name.partition(" ")
-    if _VALID_NAME_RE.match(album_name):
-        return prefix, rest
-    return "", album_name
+def compose_album_name(prefix: str, name: str, parent: str = "") -> str:
+    """'23_06' + 'Beach' (+ parent 'Trips') -> 'Trips/23_06 Beach'. An empty prefix is fine."""
+    leaf = f"{prefix.strip()} {name.strip()}".strip()
+    return f"{parent}/{leaf}" if parent else leaf
+
+
+def album_parent(name: str) -> str:
+    return name.rpartition("/")[0]
+
+
+def album_leaf(name: str) -> str:
+    return name.rpartition("/")[2]
 
 
 def yy_mm(dt: datetime) -> str:

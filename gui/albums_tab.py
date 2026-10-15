@@ -1,11 +1,12 @@
 from PySide6.QtCore import Qt, Signal, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget,
-    QListWidgetItem, QSplitter, QMessageBox, QInputDialog, QLineEdit,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QCheckBox,
+    QSplitter, QMessageBox, QInputDialog, QLineEdit,
 )
 
-from core.albums import validate_album_name
+from core.albums import validate_album_name, normalize_album_path
+from .album_tree import AlbumTree
 from .photo_grid import PhotoListModel, make_photo_view, selected_paths, PATH_ROLE
 from .preview_panel import PhotoPreview
 from .thumbnails import ThumbnailLoader
@@ -40,11 +41,15 @@ class AlbumsTab(QWidget):
         self.filter_edit.setPlaceholderText("Filter albums…")
         self.filter_edit.textChanged.connect(self.refresh)
         left_l.addWidget(self.filter_edit)
-        self.album_list = QListWidget()
-        self.album_list.currentItemChanged.connect(self._on_album_selected)
-        left_l.addWidget(self.album_list, stretch=1)
+        self.album_tree = AlbumTree()
+        self.album_tree.currentItemChanged.connect(self._on_album_selected)
+        self.album_tree.photos_dropped.connect(self._on_photos_dropped)
+        left_l.addWidget(self.album_tree, stretch=1)
+        self.new_btn = QPushButton("New album / sub-album…")
+        self.new_btn.clicked.connect(self.new_album)
+        left_l.addWidget(self.new_btn)
         row = QHBoxLayout()
-        self.rename_btn = QPushButton("Rename…")
+        self.rename_btn = QPushButton("Rename / move…")
         self.rename_btn.clicked.connect(self.rename_album)
         self.delete_btn = QPushButton("Delete album…")
         self.delete_btn.clicked.connect(self.delete_album)
@@ -59,9 +64,14 @@ class AlbumsTab(QWidget):
         mid_l.setContentsMargins(0, 0, 0, 0)
         self.title_label = QLabel("")
         mid_l.addWidget(self.title_label)
+        self.include_sub = QCheckBox("Also show photos from sub-albums")
+        self.include_sub.setChecked(True)
+        self.include_sub.toggled.connect(lambda _on: self._load_album())
+        mid_l.addWidget(self.include_sub)
         self.view = make_photo_view(self.model)
         self.view.entered.connect(self._show_path)
         self.view.doubleClicked.connect(self._open_photo)
+        self.view.rating_requested.connect(self._on_rating_requested)
         mid_l.addWidget(self.view, stretch=1)
         row2 = QHBoxLayout()
         self.remove_btn = QPushButton("Remove selected from album")
@@ -97,32 +107,16 @@ class AlbumsTab(QWidget):
     # --- album directory ----------------------------------------------------
 
     def current_album(self):
-        item = self.album_list.currentItem()
-        return item.data(Qt.ItemDataRole.UserRole) if item else None  # (id, name)
+        return self.album_tree.current_album()  # (id, full name) or None
 
     def refresh(self, *_):
-        keep = self.current_album()
-        needle = self.filter_edit.text().strip().lower()
-        self.album_list.blockSignals(True)
-        self.album_list.clear()
-        select_row = -1
-        for a in self.db.list_albums():
-            if needle and needle not in a["name"].lower():
-                continue
-            item = QListWidgetItem(f"{a['name']}    ({a['photo_count']:,})")
-            item.setData(Qt.ItemDataRole.UserRole, (a["id"], a["name"]))
-            self.album_list.addItem(item)
-            if keep and a["id"] == keep[0]:
-                select_row = self.album_list.count() - 1
-        if select_row < 0 and self.album_list.count():
-            select_row = 0
-        if select_row >= 0:
-            self.album_list.setCurrentRow(select_row)
-        self.album_list.blockSignals(False)
-        if self.album_list.count() == 0:
-            empty = QListWidgetItem("No albums yet.\nSelect photos in Browse and\nclick “Create album…”.")
-            empty.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.album_list.addItem(empty)
+        needle = self.filter_edit.text()
+        albums = self.db.list_albums()
+        self.album_tree.blockSignals(True)
+        had_selection = self.album_tree.load(albums, needle)
+        if not had_selection and self.album_tree.topLevelItemCount():
+            self.album_tree.setCurrentItem(self.album_tree.topLevelItem(0))
+        self.album_tree.blockSignals(False)
         self._load_album()
 
     def _on_album_selected(self, *_):
@@ -136,7 +130,7 @@ class AlbumsTab(QWidget):
             self.model.set_rows([])
             self.title_label.setText("Select an album on the left.")
         else:
-            rows = self.db.album_photos(cur[0])
+            rows = self.db.album_photos(cur[0], include_sub=self.include_sub.isChecked())
             self.model.set_rows(rows)
             self.title_label.setText(f"<b>{cur[1]}</b> — {len(rows):,} photo(s)")
         self.path_label.setText(" ")
@@ -146,6 +140,7 @@ class AlbumsTab(QWidget):
         has_album = self.current_album() is not None
         n = len(self.view.selectionModel().selectedIndexes())
         self.rename_btn.setEnabled(has_album)
+        self.new_btn.setEnabled(True)
         self.delete_btn.setEnabled(has_album)
         self.remove_btn.setEnabled(has_album and n > 0)
         self.selected_label.setText(f"{n:,} selected" if n else "")
@@ -171,35 +166,78 @@ class AlbumsTab(QWidget):
         paths = selected_paths(self.view)
         if not cur or not paths:
             return
-        self.db.remove_photos_from_album(cur[0], paths)
+        self.db.remove_photos_from_album(cur[0], paths, include_sub=self.include_sub.isChecked())
         self.refresh()
         self.albums_changed.emit()
 
+    def _on_rating_requested(self, paths: list, rating: int):
+        self.db.set_ratings(paths, rating)
+        for p in paths:
+            self.model.set_rating(p, rating)
+        if self.preview.current_path in paths:
+            self.preview.refresh_details()
+
+    def _on_photos_dropped(self, album_id: int, name: str, paths: list):
+        added = self.db.add_photos_to_album(album_id, paths)
+        self.refresh()
+        self.title_label.setText(self.title_label.text() + f"   (added {added} to {name})")
+        self.albums_changed.emit()
+
     # --- album actions ----------------------------------------------------------
+
+    def _ask_name(self, title: str, label: str, text: str):
+        """Ask for an album path until it's valid; returns the name or None."""
+        while True:
+            text, ok = QInputDialog.getText(
+                self, title, label, QLineEdit.EchoMode.Normal, text)
+            if not ok:
+                return None
+            name = normalize_album_path(text)
+            problem = validate_album_name(name)
+            if not problem:
+                return name
+            QMessageBox.warning(self, "Can't use that name", problem)
+            text = name
+
+    def new_album(self):
+        cur = self.current_album()
+        name = None
+        text = (cur[1] + "/") if cur else ""
+        while True:
+            name = self._ask_name(
+                "New album",
+                "Album name. Use / to put it inside another album, e.g.  23_06 Trip/Day 1\n"
+                "(a date at the start, like 23_06, is recommended but optional):", text)
+            if name is None:
+                return
+            try:
+                self.db.create_album(name)
+                break
+            except ValueError as e:
+                QMessageBox.warning(self, "Can't use that name", str(e))
+                text = name
+        self.refresh()
+        self.albums_changed.emit()
 
     def rename_album(self):
         cur = self.current_album()
         if not cur:
             return
         album_id, old = cur
-        name = old
+        text = old
         while True:
-            name, ok = QInputDialog.getText(
-                self, "Rename album",
-                "New name (date prefix, space, name — e.g. 23_06 Beach Weekend):",
-                QLineEdit.EchoMode.Normal, name,
-            )
-            if not ok or name == old:
+            name = self._ask_name(
+                "Rename / move album",
+                "New name. Change the part before the last / to move it under another album.\n"
+                "Its sub-albums come along.", text)
+            if name is None or name == old:
                 return
-            problem = validate_album_name(name)
-            if not problem:
-                try:
-                    self.db.rename_album(album_id, name)
-                except ValueError as e:
-                    problem = str(e)
-                else:
-                    break
-            QMessageBox.warning(self, "Can't use that name", problem)
+            try:
+                self.db.rename_album(album_id, name)
+                break
+            except ValueError as e:
+                QMessageBox.warning(self, "Can't use that name", str(e))
+                text = name
         self.refresh()
         self.albums_changed.emit()
 
@@ -207,10 +245,13 @@ class AlbumsTab(QWidget):
         cur = self.current_album()
         if not cur:
             return
+        subs = len(self.db.album_subtree(cur[0])) - 1
+        extra = f" and its {subs} sub-album(s)" if subs else ""
         reply = QMessageBox.question(
             self, "Delete album",
-            f"Delete the album “{cur[1]}”?\n\nOnly the album is removed. Your photos stay "
-            f"exactly where they are on disk, and return to the Browse tab.",
+            f"Delete the album “{cur[1]}”{extra}?\n\nOnly the album{'s are' if subs else ' is'} "
+            f"removed. Your photos stay exactly where they are on disk, and return to the "
+            f"Browse tab.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )

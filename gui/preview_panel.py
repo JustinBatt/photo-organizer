@@ -129,6 +129,10 @@ class PhotoPreview(QWidget):
 
     # --- facts ----------------------------------------------------------------
 
+    def refresh_details(self):
+        if self._path:
+            self._fill_details(self._path)
+
     def _fill_details(self, path: str):
         info = file_details(path)
         row = self.db.get_photo(path)
@@ -152,6 +156,8 @@ class PhotoPreview(QWidget):
             cam = " ".join(x for x in (row["camera_make"], row["camera_model"]) if x)
             if cam:
                 lines.append(line("Camera", cam))
+            if row["rating"]:
+                lines.append(line("Rating", "★" * row["rating"] + "☆" * (5 - row["rating"])))
             albums = self.db.albums_containing(path)
             if albums:
                 lines.append(line("In albums", ", ".join(albums)))

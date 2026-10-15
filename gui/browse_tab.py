@@ -6,7 +6,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QComboBox, QLineEdit, QLabel,
     QPushButton, QDateEdit, QAbstractItemView, QDialog, QListWidget,
-    QListWidgetItem, QSplitter, QMessageBox,
+    QListWidgetItem, QSplitter, QMessageBox, QInputDialog,
 )
 
 from .thumbnails import ThumbnailLoader
@@ -15,7 +15,9 @@ from .photo_grid import (  # noqa: F401  (re-exported for other modules/tests)
     PATH_ROLE, FOLDER_ROLE, THUMB, CELL_W, CELL_H,
 )
 from .preview_panel import PhotoPreview
-from .album_dialogs import CreateAlbumDialog, AddToAlbumDialog
+from .album_dialogs import AlbumDialog
+from .album_tree import AlbumTree
+from core.albums import validate_album_name, normalize_album_path
 
 # Ignore clicks closer together than this are dropped, so the second click of
 # a double-click can't ignore whatever photo slid into place after the first.
@@ -124,6 +126,15 @@ class BrowseTab(QWidget):
         self.use_dates.toggled.connect(self.run_filter)
         filter_row.addWidget(self.use_dates)
 
+        filter_row.addWidget(QLabel("Rating:"))
+        self.rating_combo = QComboBox()
+        self.rating_combo.addItem("Any", None)
+        self.rating_combo.addItem("Unrated", 0)
+        for n in range(1, 6):
+            self.rating_combo.addItem("★" * n + ("  and up" if n < 5 else ""), n)
+        self.rating_combo.currentIndexChanged.connect(self.run_filter)
+        filter_row.addWidget(self.rating_combo)
+
         filter_row.addWidget(QLabel("Search:"))
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("filename or path contains…")
@@ -176,12 +187,13 @@ class BrowseTab(QWidget):
         self.select_all_btn.clicked.connect(lambda: self.view.selectAll())
         self.clear_sel_btn = QPushButton("Clear selection")
         self.clear_sel_btn.clicked.connect(lambda: self.view.clearSelection())
-        self.create_album_btn = QPushButton("Create album from selected…")
-        self.create_album_btn.clicked.connect(self.create_album_from_selected)
         self.add_album_btn = QPushButton("Add selected to album…")
+        self.add_album_btn.setToolTip(
+            "Pick an existing album or make a new one - all in one window. "
+            "Or just drag photos onto an album in the list on the left.")
         self.add_album_btn.clicked.connect(self.add_selected_to_album)
         self.selected_label = QLabel("")
-        for w in (self.select_all_btn, self.clear_sel_btn, self.create_album_btn, self.add_album_btn):
+        for w in (self.select_all_btn, self.clear_sel_btn, self.add_album_btn):
             album_row.addWidget(w)
         album_row.addStretch()
         album_row.addWidget(self.selected_label)
@@ -191,18 +203,40 @@ class BrowseTab(QWidget):
         self.view = make_photo_view(self.model)
         self.view.clicked.connect(self._on_clicked)
         self.view.doubleClicked.connect(self._on_double_clicked)
+        self.view.rating_requested.connect(self._on_rating_requested)
         self.view.entered.connect(self._show_path)
 
         self.preview = PhotoPreview(self.db, small_loader=self.loader)
         self.view.selectionModel().currentChanged.connect(self._on_current_changed)
         self.view.selectionModel().selectionChanged.connect(self._update_selection_ui)
 
+        # album sidebar: the hierarchy stays visible while sorting
+        side = QWidget()
+        side_l = QVBoxLayout(side)
+        side_l.setContentsMargins(0, 0, 0, 0)
+        side_l.addWidget(QLabel("<b>Albums</b>"))
+        self.album_tree = AlbumTree()
+        self.album_tree.setToolTip("Drag photos onto an album to file them.\n"
+                                   "Double-click an album to add the selected photos to it.")
+        self.album_tree.photos_dropped.connect(self._on_photos_dropped)
+        self.album_tree.itemDoubleClicked.connect(self._on_album_double_clicked)
+        side_l.addWidget(self.album_tree, stretch=1)
+        hint = QLabel("Drag photos here, or double-click an album to add the selected photos.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        side_l.addWidget(hint)
+        self.new_album_btn = QPushButton("New album…")
+        self.new_album_btn.clicked.connect(self.new_empty_album)
+        side_l.addWidget(self.new_album_btn)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(side)
         splitter.addWidget(self.view)
         splitter.addWidget(self.preview)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([700, 400])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 4)
+        splitter.setStretchFactor(2, 2)
+        splitter.setSizes([230, 640, 380])
         layout.addWidget(splitter, stretch=1)
 
         # Full path of the photo under the mouse / selected, always visible.
@@ -223,7 +257,11 @@ class BrowseTab(QWidget):
         self.loader.shutdown()
         self.preview.shutdown()
 
+    def refresh_albums(self):
+        self.album_tree.load(self.db.list_albums())
+
     def refresh_folder_list(self):
+        self.refresh_albums()
         self.folder_combo.blockSignals(True)
         self.folder_combo.clear()
         self.folder_combo.addItem("All folders", None)
@@ -239,7 +277,8 @@ class BrowseTab(QWidget):
         search = self.search_box.text().strip() or None
 
         rows = self.db.browse(
-            folder=folder, date_from=date_from, date_to=date_to, search_text=search
+            folder=folder, date_from=date_from, date_to=date_to, search_text=search,
+            rating_filter=self.rating_combo.currentData(),
         )
         self.loader.cancel_pending()
         self.model.set_rows(rows)
@@ -272,6 +311,8 @@ class BrowseTab(QWidget):
 
     def _update_mode_ui(self):
         mode = self._current_mode()
+        self.view.rating_enabled = mode is None   # no star pop-ups while "ignore" is armed
+        self.view.viewport().update()
         if mode == "file":
             self.mode_label.setText(
                 "<b style='color:#c0392b'>IGNORE-FILE MODE IS ON</b> — every photo you click is "
@@ -312,8 +353,7 @@ class BrowseTab(QWidget):
     def _update_selection_ui(self, *_):
         n = len(self.view.selectionModel().selectedIndexes())
         self.selected_label.setText(f"{n:,} selected" if n else "")
-        for btn in (self.create_album_btn, self.add_album_btn):
-            btn.setEnabled(n > 0)
+        self.add_album_btn.setEnabled(n > 0)
         self.clear_sel_btn.setEnabled(n > 0)
 
     # --- albums ---------------------------------------------------------------
@@ -329,35 +369,71 @@ class BrowseTab(QWidget):
             return [], []
         return paths, self.db.photos_by_paths(paths)
 
-    def create_album_from_selected(self):
+    def add_selected_to_album(self):
         paths, rows = self._selected_photo_rows()
         if not paths:
             return
-        dlg = CreateAlbumDialog(self.db, rows, self)
+        dlg = AlbumDialog(self.db, rows, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        self._put_in_album(dlg.album_name, paths, dlg.existing_album_id)
-
-    def add_selected_to_album(self):
-        paths, _rows = self._selected_photo_rows()
-        if not paths:
-            return
-        dlg = AddToAlbumDialog(self.db, len(paths), self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        if dlg.wants_new:
-            self.create_album_from_selected()
             return
         self._put_in_album(dlg.album_name, paths, dlg.album_id)
+
+    def _on_album_double_clicked(self, item, _column):
+        album_id, name = item.data(0, Qt.ItemDataRole.UserRole)
+        paths = selected_paths(self.view)
+        if paths:
+            self._put_in_album(name, paths, album_id)
+
+    def _on_photos_dropped(self, album_id: int, name: str, paths: list):
+        self._put_in_album(name, paths, album_id)
+
+    def new_empty_album(self):
+        sel = self.album_tree.current_album()
+        text = (sel[1] + "/") if sel else ""
+        while True:
+            text, ok = QInputDialog.getText(
+                self, "New album",
+                "Album name. Use / for a sub-album, e.g.  23_06 Trip/Day 1\n"
+                "(a date at the start, like 23_06, is recommended but optional):",
+                QLineEdit.EchoMode.Normal, text,
+            )
+            if not ok:
+                return
+            name = normalize_album_path(text)
+            problem = validate_album_name(name)
+            if not problem:
+                try:
+                    self.db.create_album(name)
+                except ValueError as e:
+                    problem = str(e)
+                else:
+                    break
+            QMessageBox.warning(self, "Can't use that name", problem)
+        self.refresh_albums()
+        self.albums_changed.emit()
+
+    # --- ratings ----------------------------------------------------------------
+
+    def _on_rating_requested(self, paths: list, rating: int):
+        self.db.set_ratings(paths, rating)
+        for p in paths:
+            self.model.set_rating(p, rating)
+        if self.preview.current_path in paths:
+            self.preview.refresh_details()
+        if rating == 0:
+            self.path_label.setText(f"Cleared the rating of {len(paths)} photo(s)")
+        else:
+            stars = "★" * rating + "☆" * (5 - rating)
+            what = paths[0] if len(paths) == 1 else f"{len(paths)} photos"
+            self.path_label.setText(f"{stars}   {what}")
 
     def _put_in_album(self, name: str, paths: list[str], album_id):
         created = album_id is None
         if created:
             try:
                 album_id = self.db.create_album(name)
-            except ValueError as e:  # created elsewhere in the meantime
-                QMessageBox.warning(self, "Album exists", str(e))
-                return
+            except ValueError:  # created elsewhere in the meantime - just use it
+                album_id = self.db.album_id_by_name(name)
         self.db.add_photos_to_album(album_id, paths)
 
         moved = set(paths)
@@ -368,6 +444,7 @@ class BrowseTab(QWidget):
         if self.preview.current_path in moved:
             self.preview.clear()
         self._update_selection_ui()
+        self.refresh_albums()
         self.mode_label.setText(
             f"<b>{'Created album' if created else 'Added to album'} “{name}”</b> with "
             f"{len(moved):,} photo(s). They no longer show here - find them in the "

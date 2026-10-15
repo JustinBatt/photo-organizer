@@ -100,8 +100,17 @@ class DuplicateReviewTab(QWidget):
             "mostly duplicated elsewhere."
         ))
         self.folder_tree = QTreeWidget()
-        self.folder_tree.setHeaderLabels(["Folder / File", "Detail"])
-        self.folder_tree.setColumnWidth(0, 330)
+        self.folder_tree.setHeaderLabels(
+            ["Folder / File", "Photos", "Sub-folders", "Duplicated elsewhere", "Unique", "Recommendation"])
+        self.folder_tree.setColumnWidth(0, 300)
+        self.folder_tree.setColumnWidth(1, 55)
+        self.folder_tree.setColumnWidth(2, 115)
+        self.folder_tree.setColumnWidth(3, 130)
+        self.folder_tree.setColumnWidth(4, 55)
+        self.folder_tree.setTextElideMode(Qt.TextElideMode.ElideLeft)  # keep the END of long paths visible
+        self.folder_tree.setToolTip("Photos = photos directly in the folder.\n"
+                                    "Sub-folders = folders beneath it that hold photos (they move with it if you quarantine it).\n"
+                                    "Duplicated elsewhere = how many of its photos also exist in a different folder.")
         self.folder_tree.itemChanged.connect(self._on_folder_item_changed)
         self.folder_tree.currentItemChanged.connect(
             lambda cur, _prev: self._on_item_selected(self.folder_tree, cur))
@@ -133,7 +142,7 @@ class DuplicateReviewTab(QWidget):
         main_split.addWidget(self.compare)
         main_split.setStretchFactor(0, 2)
         main_split.setStretchFactor(1, 3)
-        main_split.setSizes([520, 640])
+        main_split.setSizes([800, 560])
 
         layout.addWidget(main_split, stretch=1)
 
@@ -187,10 +196,18 @@ class DuplicateReviewTab(QWidget):
         for fg in folder_groups:
             is_full = fg.status == FOLDER_STATUS_FULL_DUP
             status_label = "SURVIVE (full duplicate)" if is_full else "DELETE duplicated subset"
+            pct = round(100 * fg.duplicated / fg.total) if fg.total else 0
+            if fg.subfolder_count:
+                subs = f"{fg.subfolder_count} ({fg.subfolder_photos:,} photos)"
+            else:
+                subs = "none"
             parent = QTreeWidgetItem([
-                f"{fg.folder}  ({fg.duplicated}/{fg.total} duplicated)",
-                status_label,
+                fg.folder, f"{fg.total:,}", subs,
+                f"{fg.duplicated:,} of {fg.total:,}  ({pct}%)",
+                f"{len(fg.unique_photo_paths):,}", status_label,
             ])
+            for col in (1, 4):
+                parent.setTextAlignment(col, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             # The folder row's tick is kept in step with its files by hand
             # (see _on_folder_item_changed) - Qt's automatic tri-state mode drops
             # the checkbox when a folder also holds a non-checkable "unique photos" row.
@@ -198,37 +215,57 @@ class DuplicateReviewTab(QWidget):
             parent.setData(0, DELETABLE_ROLE, False)
             parent.setData(0, FOLDER_ROLE, fg.folder)
             parent.setToolTip(0, fg.folder)
-            parent.setToolTip(1, fg.recommendation)
+            parent.setToolTip(5, fg.recommendation)
+            if fg.subfolder_count:
+                parent.setToolTip(2, "Quarantining this folder moves these sub-folders too.")
 
             for path in fg.duplicated_photo_paths:
-                child = QTreeWidgetItem([os.path.basename(path), path])
+                child = QTreeWidgetItem([os.path.basename(path), "", "", "", "", self._also_in(path)])
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 on = self._want_checked(path)
                 child.setCheckState(0, Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
                 child.setData(0, PATH_ROLE, path)
                 child.setData(0, DELETABLE_ROLE, True)
+                child.setToolTip(0, path)
                 parent.addChild(child)
             self._sync_folder_state(parent)
 
             if fg.unique_photo_paths:
                 note = QTreeWidgetItem([
                     f"{len(fg.unique_photo_paths)} unique photo(s) — review in Browse tab",
-                    "Not touched here",
+                    "", "", "", "", "Not touched here",
                 ])
                 note.setFlags(Qt.ItemFlag.ItemIsEnabled)  # not checkable
                 note.setData(0, DELETABLE_ROLE, False)
                 note.setData(0, FOLDER_ROLE, fg.folder)
                 for p in fg.unique_photo_paths:
-                    sub = QTreeWidgetItem([os.path.basename(p), p])
+                    sub = QTreeWidgetItem([os.path.basename(p), "", "", "", "", "unique"])
                     sub.setFlags(Qt.ItemFlag.ItemIsEnabled)
                     sub.setData(0, DELETABLE_ROLE, False)
                     sub.setData(0, PATH_ROLE, p)
+                    sub.setToolTip(0, p)
                     note.addChild(sub)
                 parent.addChild(note)
 
             self.folder_tree.addTopLevelItem(parent)
             parent.setExpanded(False)
         self._suppress_cascade = False
+
+    def _also_in(self, path: str) -> str:
+        """Where the other copies of a photo live, e.g. 'also in: Trip, Backup (+1)'."""
+        group = self._group_by_path.get(path)
+        if group is None:
+            return ""
+        mine = os.path.dirname(path).lower()
+        others = []
+        for r in group.photos:
+            folder = r["folder"]
+            if folder.lower() != mine and os.path.basename(folder) not in others:
+                others.append(os.path.basename(folder))
+        if not others:
+            return ""
+        shown = ", ".join(others[:2]) + (f" (+{len(others) - 2})" if len(others) > 2 else "")
+        return f"also in: {shown}"
 
     def _populate_indiv_tree(self, groups):
         hide = self.hide_confirmed.isChecked()
